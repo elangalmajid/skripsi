@@ -1,0 +1,282 @@
+Siap. Berikut **penjelasan lengkap per cell** untuk notebook `gnn_coffee_beans.ipynb` yang tadi kubuat. Urutan dan isi mengikuti cell di notebook tersebut.
+
+---
+
+### 1) Markdown – Judul & gambaran proyek
+
+Menjelaskan tujuan notebook: mengubah pendekatan CNN menjadi **Graph Neural Network (GNN)** dengan **superpixel** sebagai node. Di sini juga dijelaskan struktur folder dataset yang diharapkan (`train/`, `val/`, `test/`, masing-masing berisi subfolder per kelas).
+
+**Kenapa superpixel?**
+Superpixel (SLIC) mereduksi piksel menjadi segmen homogen sehingga graf menjadi lebih ringkas (node = superpixel), memudahkan GNN belajar struktur spasial.
+
+---
+
+### 2) Code – (Opsional) Instalasi dependensi
+
+Berisi perintah `pip install` untuk memasang:
+
+* `spektral`: framework GNN berbasis Keras/TensorFlow,
+* `scikit-image`: untuk SLIC superpixel,
+* `scikit-learn`: untuk k-NN (membangun edge),
+* `tensorflow`: backend model.
+
+> Catatan: jalankan hanya jika environment belum memiliki paket. Pada environment offline, instalasi perlu dilakukan manual.
+
+---
+
+### 3) Code – Import library & seed
+
+* Import pustaka utama (`os`, `glob`, `numpy`, `tensorflow`, `matplotlib` opsional untuk visualisasi).
+* Dari `skimage`: `io`, `transform`, `color`, `slic` untuk memuat, resize, konversi warna Lab, dan segmentasi superpixel.
+* Dari `sklearn.neighbors`: `NearestNeighbors` untuk membentuk **edge k-NN** di graf.
+* Dari `spektral`: komponen **Dataset**, **Graph**, **DisjointLoader** (loader untuk batch multi-graf), layer `GCNConv` dan `GlobalSumPool`.
+* Keras: `Model`, `Input`, `Dense`, `Dropout`, `BatchNormalization`.
+* Set seed (`random`, `numpy`, `tensorflow`) agar eksperimen lebih reprodusibel.
+* Cetak versi TensorFlow untuk referensi.
+
+**Peran DisjointLoader:** menggabungkan banyak graf berbeda (ukuran node/edge variabel) menjadi sebuah batch “disjoint” dengan tensor \[X, A, I].
+
+---
+
+### 4) Markdown – Konfigurasi & Path Dataset
+
+Judul bagian konfigurasi.
+
+---
+
+### 5) Code – Konfigurasi path & hyperparameter
+
+* `training_path`, `validation_path`, `testing_path`: lokasi folder dataset. **Silakan sesuaikan** ke struktur kamu.
+* `IMG_SIZE`: ukuran target gambar sebelum SLIC (resize ke 256×256).
+* `N_SEGMENTS`: jumlah superpixel per gambar (node count kira-kira ≈ nilai ini).
+* `COMPACTNESS`: parameter SLIC (trade-off warna vs spasial; makin besar → superpixel lebih “kompak”).
+* `KNN_K`: jumlah tetangga untuk membangun edge k-NN (kepadatan graf).
+* `BATCH_SIZE`, `EPOCHS`, `LEARNING_RATE`: hyperparameter training.
+* `FEATURES_DIM = 8`: dimensi fitur node yang akan dibuat (penjelasan detail ada di cell konversi gambar→graf).
+
+**Tips:**
+
+* `N_SEGMENTS` 80–200 lazim; lebih besar → detail naik, komputasi juga naik.
+* `KNN_K` 6–10 sering stabil; terlalu kecil → graf jarang, terlalu besar → noise.
+
+---
+
+### 6) Markdown – Utilitas: listing file & mapping label
+
+Judul bagian utilitas.
+
+---
+
+### 7) Code – Utilitas: pembacaan file, loading gambar, konversi ke graf
+
+Terdiri dari 3 fungsi kunci:
+
+1. `list_files_labels(root_dir)`
+
+   * Menemukan semua subfolder (kelas), membuat peta `label_to_id` dan `id_to_label`.
+   * Mengumpulkan semua file gambar (`jpg`, `png`, `bmp`, `tif`, `webp`, dst) dengan label ID-nya.
+   * **Output:** list `(filepath, label_id)`, `id_to_label`.
+
+2. `load_image(path, img_size)`
+
+   * Membaca gambar, pastikan 3 kanal (konversi grayscale→RGB, potong alpha kalau RGBA).
+   * `transform.resize` ke `img_size×img_size`, `float32` di-scale 0–1.
+
+3. `image_to_superpixel_graph(img, n_segments, compactness, knn_k)`
+
+   * Segmentasi **SLIC**: menghasilkan `segments` dengan label segmen 0..N-1.
+   * Konversi `img` ke **Lab** (`color.rgb2lab`) agar fitur warna lebih stabil terhadap pencahayaan.
+   * Untuk tiap superpixel (node):
+
+     * Hitung **mean** dan **std** dari kanal **L**, **a**, **b** → 6 fitur (Lm, am, bm, Ls, as, bs).
+     * Hitung centroid posisi `(cy, cx)` lalu **normalisasi** ke 0..1 → 2 fitur (cx\_n, cy\_n).
+     * **Total fitur node = 8**: `[Lm, am, bm, cx_n, cy_n, Ls, as, bs]`.
+   * Bangun **adjacency** lewat **k-NN** atas centroid superpixel (euclidean). Buat matriks A simetris (undirected).
+   * (Opsional) Normalisasi fitur per graf (baris dikomentari) bila mau.
+
+**Output:**
+
+* `X`: matriks fitur node `(n_nodes, 8)`.
+* `A`: adjacency `(n_nodes, n_nodes)` biner.
+
+**Catatan penting:**
+
+* Jika ada superpixel berisi 1 piksel, `std` akan 0 (sudah ditangani).
+* `k = min(knn_k+1, n_nodes)` karena hasil k-NN menyertakan diri sendiri (self), lalu self dibuang.
+
+---
+
+### 8) Markdown – Dataset kustom Spektral
+
+Judul bagian dataset.
+
+---
+
+### 9) Code – Kelas `CoffeeSuperpixelDataset(Dataset)`
+
+Membungkus pipeline menjadi dataset siap **Spektral**:
+
+* `__init__`: simpan konfigurasi (path, ukuran, SLIC, k-NN), panggil `list_files_labels`, tentukan `n_classes`.
+* `read()`: untuk setiap file:
+
+  * Load gambar → konversi ke graf (`X`, `A`).
+  * Buat label one-hot `y` sesuai `n_classes`.
+  * Kembalikan list `spektral.data.Graph(x=X, a=A, y=y)`.
+
+**Kenapa dataset custom?**
+Supaya bisa dipakai `DisjointLoader` dan training loop Keras dengan batch graf variabel.
+
+---
+
+### 10) Markdown – Bangun Dataset & DataLoader
+
+Judul bagian pembuatan dataset dan loader.
+
+---
+
+### 11) Code – Instansiasi dataset & loader
+
+* Buat `train_ds`, `val_ds`, `test_ds` dari path.
+* Tentukan `N_CLASSES` dari `train_ds`.
+* Cetak daftar kelas untuk verifikasi label mapping.
+* Buat **DisjointLoader** untuk `train/val/test` dengan `batch_size` dan `shuffle` sesuai kebutuhan.
+
+**Tentang DisjointLoader:**
+
+* Menghasilkan 3 tensor saat training:
+
+  * `X` (fitur node semua graf dalam batch, ditumpuk),
+  * `A` (adjacency block diagonal),
+  * `I` (graph indicator: untuk setiap node, ID graf mana dia berasal).
+* Keras + Spektral akan mengurai format ini otomatis saat `fit()`.
+
+---
+
+### 12) Markdown – Arsitektur GNN
+
+Judul bagian model.
+
+---
+
+### 13) Code – Definisi model `GNNModel` (GCN → pooling → Dense)
+
+Arsitektur:
+
+* **2× `GCNConv`** (Graph Convolution) dengan aktivasi ReLU.
+* **BatchNormalization** + **Dropout** di antara layer untuk stabilitas dan regularisasi.
+* **GlobalSumPool**: agregasi node-level menjadi graph-level representasi (bisa diganti mean/max).
+* **Dense(128, ReLU)** → **Dropout** → **Dense(n\_classes, softmax)**.
+
+Kompilasi:
+
+* Optimizer **Adam** (`learning_rate=1e-3` default dari config).
+* Loss **categorical\_crossentropy** (label one-hot).
+* Metrik **accuracy**.
+
+`model.build(input_shape=[(None, None, FEATURES_DIM), (None, None), (None,)])`
+Hanya untuk menyiapkan summary; bentuk input mengikuti **disjoint**:
+
+* `X`: `(batch_nodes, FEATURES_DIM)` → di sini ditulis `(None, None, FEATURES_DIM)` demi kesesuaian build,
+* `A`: `(batch_nodes, batch_nodes)`,
+* `I`: `(batch_nodes,)`.
+
+**Alternatif:**
+
+* Coba `GraphSageConv`, `GATConv` (dengan perhatian/attention).
+* Global pooling bisa diganti `GlobalAvgPool` atau `GlobalMaxPool`.
+
+---
+
+### 14) Markdown – Training
+
+Judul bagian training.
+
+---
+
+### 15) Code – Training loop (fit)
+
+* **Callbacks**:
+
+  * `ReduceLROnPlateau(monitor='val_accuracy')`: turunkan LR saat val-acc stagnan.
+  * `EarlyStopping(monitor='val_accuracy', restore_best_weights=True)`: hentikan dini & pulihkan bobot terbaik.
+* `model.fit()` dengan:
+
+  * `train_loader.load()` sebagai data,
+  * `steps_per_epoch=train_loader.steps_per_epoch` (wajib untuk generator),
+  * `validation_data=val_loader.load()`, `validation_steps=val_loader.steps_per_epoch`,
+  * `epochs=EPOCHS`.
+
+**Catatan:**
+Pastikan jumlah file di val set cukup agar `validation_steps` tidak 0.
+
+---
+
+### 16) Markdown – Evaluasi
+
+Judul bagian evaluasi.
+
+---
+
+### 17) Code – Evaluasi pada test set
+
+* `model.evaluate(test_loader.load(), steps=test_loader.steps_per_epoch)`
+* Mencetak dict `{'loss': ..., 'accuracy': ...}`.
+
+**Tips tambahan:**
+
+* Untuk metrik detail, bisa tambahkan confusion matrix dan classification report (sklearn) dengan melakukan prediksi ke seluruh test set.
+
+---
+
+### 18) Markdown – Inferensi contoh & visualisasi superpixel
+
+Judul bagian inferensi & visual.
+
+---
+
+### 19) Code – Prediksi sampel & overlay superpixel
+
+* Pilih 3 file acak dari test set.
+* Untuk tiap file:
+
+  * Load gambar, konversi ke graf `(X, A)`.
+  * Buat `I` = vektor nol sepanjang jumlah node (batch 1 graf → semua node milik graf 0).
+  * `model.predict([X[None,...], A[None,...], I[None,...]])` → pilih argmax kelas, cetak label + probabilitas.
+  * `visualize_superpixels(fp)`: tampilkan gambar dengan kontur superpixel SLIC.
+
+**Tujuan:** debug cepat apakah segmentasi oke & prediksi kelas masuk akal.
+
+---
+
+### 20) Markdown – Catatan & Tips
+
+Ringkasan saran eksperimen:
+
+* Tuning **N\_SEGMENTS** dan **KNN\_K**,
+* Augmentasi sebelum SLIC (flip/rotate/brightness) untuk robustnes,
+* Coba layer GNN lain (GraphSAGE/GAT),
+* Simpan peta label `id_to_label` untuk inference/deployment.
+
+---
+
+## Alur Data Singkat (end-to-end)
+
+1. **File → Gambar:** baca & resize (Cell 7 `load_image`).
+2. **Gambar → Graf:** SLIC → node features (Lab mean/std + posisi) & edge k-NN (Cell 7 `image_to_superpixel_graph`).
+3. **Graf → Dataset:** bungkus ke `Graph(x, a, y)` (Cell 9).
+4. **Batching:** `DisjointLoader` gabungkan graf menjadi batch disjoint `[X, A, I]` (Cell 11).
+5. **Model:** GCNConv → GCNConv → GlobalSumPool → Dense → Softmax (Cell 13).
+6. **Training/Evaluasi:** `fit()` & `evaluate()` dengan loader (Cell 15 & 17).
+7. **Inferensi & Visual:** prediksi sampel & tampilkan superpixel (Cell 19).
+
+---
+
+## Potensi Penyesuaian / Debug
+
+* **Memori**: `A` berukuran `(n_nodes, n_nodes)`. Jika `N_SEGMENTS` besar dan batch besar → RAM tinggi. Kurangi `N_SEGMENTS`/`BATCH_SIZE`.
+* **Kelas tidak seimbang**: bisa pakai class weights (`fit(class_weight=...)`) atau oversampling.
+* **Augmentasi**: tambahkan augmentasi di level gambar sebelum SLIC agar struktur graf bervariasi.
+* **Pooling**: uji `GlobalAvgPool`/`GlobalMaxPool`; atau gunakan readout attention.
+* **Layer**: ganti `GCNConv` dengan `GATConv` (perlu perhatian pada waktu komputasi).
+
+Kalau kamu mau, aku bisa **menambahkan cell confusion matrix**, **augmentasi gambar**, atau **varian arsitektur (GraphSAGE/GAT)** sesuai kebutuhanmu.

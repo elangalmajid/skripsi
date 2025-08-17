@@ -1,0 +1,4 @@
+Class,Precision,Recall,F1 Score
+Benchpress,0.5,0.5,0.5
+Deadlift,0.6428571428571429,0.9,0.75
+Squat,0.8333333333333334,0.5,0.625

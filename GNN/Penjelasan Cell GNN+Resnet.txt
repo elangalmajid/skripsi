@@ -1,0 +1,257 @@
+Siap! Berikut **penjelasan lengkap setiap cell** pada notebook `cnn_gnn_hybrid.ipynb` yang baru saya buat. Saya jelaskan tujuan, variabel penting, apa yang bisa kamu ubah, dan hal-hal yang sering bikin error.
+
+---
+
+## Cell 0 — Markdown: Judul & ringkasan
+
+**Apa yang ada di sini:**
+Penjelasan singkat konsep Hybrid: **ResNet50 (pretrained, dibekukan) → GCN head → classifier** untuk dataset kecil (\~500/kelas).
+
+**Kenapa penting:**
+Memberi konteks alur: gambar → feature map (≈14×14×1024) → graph grid (node = patch feature) → 2 layer GCN → pooling → linear classifier.
+
+---
+
+## Cell 1 — Imports, device, seed
+
+**Isi utama:**
+
+* Import PyTorch, TorchVision, sklearn metrics, matplotlib.
+* Fungsi `set_seed(42)` untuk reprodusibilitas.
+* Pilih `device = 'cuda'` jika ada GPU; fallback ke CPU.
+
+**Yang bisa kamu ubah:**
+
+* `set_seed(…)` kalau perlu eksperimen non-deterministic (ganti angkanya).
+* Jika kamu pakai **DirectML**, ubah device selection (opsional):
+
+  ```python
+  import torch_directml as tdm
+  device = tdm.device()  # jika environment mendukung
+  ```
+
+**Pitfall umum:**
+Pastikan versi `torchvision` mendukung `ResNet50_Weights`.
+
+---
+
+## Cell 2 — Config (path, split, hyperparameter)
+
+**Isi utama:**
+
+* `DATA_DIR`: **ganti** ke folder dataset `ImageFolder` (punya `train/val/test`).
+* `USE_EXISTING_SPLIT = True`: pakai struktur split yang sudah ada.
+* Opsi autosplit (kalau `USE_EXISTING_SPLIT=False`), set `SINGLE_DIR`, `OUTPUT_SPLIT_DIR`.
+* Hyperparams: `IMG_SIZE`, `BATCH_SIZE`, `EPOCHS`, `LR`, `WEIGHT_DECAY`, `GCN_HIDDEN`, `GCN_DROPOUT`, `GRID_RADIUS`.
+
+**Yang bisa kamu ubah (paling sering):**
+
+* `DATA_DIR` → **wajib** disesuaikan.
+* `BATCH_SIZE` (naikkan kalau GPU kuat; turunkan jika OOM).
+* `EPOCHS` 15–30 untuk baseline awal.
+* `LR` 1e-3 bagus untuk head-only; kalau unfreeze backbone nanti, pakai 1e-5–5e-5.
+* `GRID_RADIUS`: 1 (4 tetangga), 2 (jangkauan lebih luas—lebih banyak edge).
+
+---
+
+## Cell 3 — Optional autosplit (dari satu folder → train/val/test)
+
+**Isi utama:**
+
+* Fungsi `autosplit_from_single_dir(...)` membagi data per kelas ke `train/val/test` berdasar rasio.
+* Dieksekusi **hanya** jika `USE_EXISTING_SPLIT=False`.
+
+**Kapan dipakai:**
+Kalau kamu cuma punya satu folder berisi subfolder kelas (tanpa split). Hasilnya ditulis ke `OUTPUT_SPLIT_DIR`.
+
+**Catatan:**
+Fungsi menyalin file (bukan symlink). Pastikan ruang disk cukup.
+
+---
+
+## Cell 4 — Transforms, Datasets, Dataloaders
+
+**Isi utama:**
+
+* `train_tf`: augmentasi agresif (flip/rotate/crop/color jitter) + normalisasi **ImageNet mean/std**.
+* `eval_tf`: resize + normalisasi (tanpa augmentasi).
+* `datasets.ImageFolder` untuk `train/val/test`.
+* `class_names`: urutan kelas (penting untuk metrik & confusion matrix).
+* `DataLoader`: `pin_memory=True` untuk performance di GPU.
+
+**Yang bisa kamu ubah:**
+
+* Tambah/kurangi augmentasi (`ColorJitter`, `RandomResizedCrop`) sesuai variasi data.
+* `IMG_SIZE` → tetap 224 untuk ResNet50; kalau ubah, feature map & graph shape ikut berubah otomatis.
+
+**Pitfall:**
+Pastikan struktur folder seperti:
+
+```
+DATA_DIR/
+  train/classA/..., train/classB/...
+  val/classA/...,   val/classB/...
+  test/classA/...,  test/classB/...
+```
+
+---
+
+## Cell 5 — Graph builder, GCN layer, Frozen backbone, Hybrid model
+
+**Komponen penting:**
+
+1. `build_grid_adjacency(H, W, radius, self_loop)`
+
+   * Buat adjacency **grid** untuk node = lokasi (h,w) pada feature map.
+   * Tetangga 4-arah (radius=1). Jika `radius=2`, jangkauan melebar.
+   * Normalisasi simetris: **Ā = D^{-1/2}(A + I)D^{-1/2}** (stabilkan pesan GCN).
+   * Output ukuran **(N, N)** dengan **N=H×W**. Untuk 224×224 ke layer3 ResNet50, biasanya **H=W=14** → **N=196** (masih kecil).
+
+2. `SimpleGCNLayer`
+
+   * Implementasi GCN ringan: `AX → Linear → ReLU → Dropout`.
+   * Dipanggil dua kali (2-layer) untuk memperkaya representasi node.
+
+3. `FrozenResNetBackbone`
+
+   * ResNet50 pretrained sampai **layer3** (bukan layer4) agar grid tetap rapat (≈14×14).
+   * Semua parameter **dibekukan** (`requires_grad=False`).
+   * Output channel = 1024.
+
+4. `CNN_GNN_Hybrid`
+
+   * Forward: `backbone(x) → feat(B,C,H',W') → nodes(B,N,C) → GCN x2 → mean pooling → classifier`.
+   * **Caching graph:** `A_hat` dibuat **sekali** setelah tahu `(H',W')` dan disimpan sebagai **buffer** (hemat waktu).
+   * `grid_shape` diupdate otomatis jika ukuran berubah.
+
+**Yang bisa kamu ubah:**
+
+* `radius` (tetangga lebih jauh → lebih banyak koneksi → mungkin lebih baik tapi lebih berat).
+* `gcn_hidden` (default 256; naikkan jika GPU masih lapang).
+
+**Pitfall:**
+Adjacency dibuat **dense** (N×N). Dengan N=196 aman; jika IMG\_SIZE berbeda sampai N besar, bisa berat di memori.
+
+---
+
+## Cell 6 — Inisialisasi model, optimizer, scheduler, loss
+
+**Isi utama:**
+
+* Buat `hybrid = CNN_GNN_Hybrid(...)`.
+* Filter hanya parameter yang `requires_grad=True` (head & classifier).
+* `optimizer = AdamW`, `scheduler = CosineAnnealingLR`.
+* `criterion = CrossEntropyLoss`.
+* `scaler` untuk **AMP** (mixed precision) jika ada CUDA.
+
+**Output:**
+Cetak jumlah **parameter trainable** (harus jauh lebih kecil dibanding full ResNet50).
+
+**Yang bisa kamu ubah:**
+
+* Optimizer (SGD + momentum) jika butuh.
+* Scheduler (mis. `ReduceLROnPlateau`) bila validasi stagnan.
+
+---
+
+## Cell 7 — Train loop + Early Stopping
+
+**Alur:**
+
+* Fungsi `run_epoch(loader, train_mode)` untuk 1 pass (train/val).
+* Training pakai AMP (`torch.cuda.amp.autocast`) jika ada CUDA.
+* Metrik yang dicetak per epoch: `train_loss/acc`, `val_loss/acc`.
+* **Early stopping** pakai `PATIENCE` berdasarkan `val_acc`.
+
+**Yang bisa kamu ubah:**
+
+* Kriteria early stopping (mis. pakai `val_loss` bukan `val_acc`).
+* Tambah logging history (list/CSV) jika ingin plot kurva loss/acc.
+
+**Output:**
+Simpan **best state** ke memori; setelah loop, **load** best; simpan ke file:
+`cnn_gnn_hybrid_best.pth` (berisi `state_dict` dan `classes`).
+
+**Pitfall:**
+Kalau `val_loader` kosong (split tidak benar), metrik akan aneh → pastikan split ada.
+
+---
+
+## Cell 8 — Evaluasi (Test): P/R/F1, classification report, Confusion Matrix
+
+**Isi utama:**
+
+* Kumpulkan prediksi pada `test_loader`.
+* **Per-class metrics**: `precision_recall_fscore_support(..., average=None, zero_division=0)` dengan label `[0..num_classes-1]`.
+* **Weighted metrics**: `average='weighted'`.
+* Cetak `classification_report(...)` (per kelas).
+* Plot **Confusion Matrix** (pakai `ConfusionMatrixDisplay`) → **tidak** set style/warna khusus.
+* Buat **DataFrame** ringkas `Class, Precision, Recall, F1, Support`.
+
+**Yang bisa kamu ubah:**
+
+* Tambahkan **row-normalized CM** (opsional) kalau ingin lihat recall per kelas:
+
+  ```python
+  cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1)
+  ```
+* Simpan tabel metrik ke CSV.
+
+**Pitfall:**
+Jika `class_names` dan label prediksi **tidak se-urutan**, metrik bersilang. Di alur ini, urutan `ImageFolder` konsisten → aman.
+
+---
+
+## Cell 9 — Markdown: Optional fine-tuning
+
+**Isi:**
+Penjelasan membuka sebagian backbone (mis. `layer3`) jika ingin **sedikit** fine-tune setelah head stabil.
+
+**Kapan dipakai:**
+Kalau validasi sudah stabil tapi ingin dorong sedikit lagi performa → unfreeze separuh kecil backbone, **LR kecil** (1e-5…5e-5), beberapa epoch.
+
+---
+
+## Cell 10 — Kode: Unfreeze backbone & contoh loop lanjut
+
+**Isi utama:**
+
+* Fungsi `unfreeze_backbone(hybrid_model, target_prefixes=("layer3",))`: set `requires_grad=True` untuk parameter yang cocok.
+* Contoh: setelah memanggil `unfreeze_backbone(hybrid)`, **redefinisikan optimizer** pakai parameter trainable baru dan **LR kecil**, lalu jalankan kembali loop beberapa epoch.
+
+**Pitfall:**
+Setelah unfreeze, **wajib** buat optimizer baru yang hanya memuat parameter `requires_grad=True`; kalau tidak, optimizer lama tidak akan mengupdate layer yang baru dibuka.
+
+---
+
+# FAQ singkat & tips
+
+* **Kenapa backbone dihentikan di `layer3` (bukan `layer4`)?**
+  Agar feature map cukup rapat (≈14×14), sehingga **graph node count = 196** (ringan) dan GCN punya “spasial” yang cukup.
+
+* **Kalau ingin graph lebih padat?**
+  Set `GRID_RADIUS=2` agar node terhubung ke tetangga lebih jauh (akan menambah edge). Coba di val; jika over-smoothing (semua fitur mirip), turunkan lagi.
+
+* **Mengatasi overfitting:**
+  Tambah `GCN_DROPOUT`, perkuat augmentasi, atau kurangi `GCN_HIDDEN`.
+
+* **Mengganti backbone:**
+  Bisa ganti ke EfficientNet/ConvNeXt/ViT, tapi pastikan mudah mengambil **feature map 2D** (H×W) agar bisa dijadikan grid node.
+
+* **File model tersimpan di mana?**
+  `cnn_gnn_hybrid_best.pth` di direktori kerja. Muat kembali dengan:
+
+  ```python
+  ckpt = torch.load("cnn_gnn_hybrid_best.pth", map_location=device)
+  hybrid.load_state_dict(ckpt["state_dict"]); class_names = ckpt["classes"]
+  hybrid.eval()
+  ```
+
+---
+
+Kalau kamu mau, aku bisa tambahkan **cell ekstra** untuk:
+
+* menyimpan `class_metrics_df` ke **CSV**,
+* **plot CM ter-normalisasi**,
+* atau membuat **predict single image** (utility inference).
+  Bilang saja yang kamu butuh, nanti aku sisipkan langsung di notebook.
