@@ -1,4 +1,5 @@
-,Predicted Benchpress,Predicted Deadlift,Predicted Squat
-Actual Benchpress,8,0,2
-Actual Deadlift,2,8,0
-Actual Squat,1,6,3
+,Predicted Dark,Predicted Green,Predicted Light,Predicted Medium
+Dark,56,0,0,2
+Green,0,68,0,0
+Light,0,0,56,0
+Medium,0,0,0,56
